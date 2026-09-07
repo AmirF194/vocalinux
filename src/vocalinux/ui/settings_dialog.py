@@ -5186,6 +5186,8 @@ class SettingsDialog(Gtk.Dialog):
         """Handle changes in the selected model."""
         if self._populating_models:
             return
+        if self._initializing or self._applying_settings:
+            return
 
         if self._get_selected_engine() == "whisper_cpp":
             model_size = self.model_combo.get_active_id()
@@ -5204,6 +5206,8 @@ class SettingsDialog(Gtk.Dialog):
     def _on_model_variant_changed(self, widget):
         """Handle changes in the selected whisper.cpp specialization."""
         if self._populating_models:
+            return
+        if self._initializing or self._applying_settings:
             return
 
         self._sync_language_options_for_selected_model()
@@ -5290,6 +5294,8 @@ class SettingsDialog(Gtk.Dialog):
     def _on_language_changed(self, widget):
         """Handle language selection change."""
         if self._processing_language_change:
+            return
+        if self._initializing or self._applying_settings:
             return
 
         lang_code = self.language_combo.get_active_id()
@@ -5480,6 +5486,9 @@ class SettingsDialog(Gtk.Dialog):
             return
 
         self._applying_settings = True
+        # Already-downloaded apply is handed to a worker that clears this flag
+        # via GLib.idle_add. Download still holds it for the modal run() below.
+        worker_holds_guard = False
         try:
             settings = self.get_selected_settings()
             engine = settings.get("engine", "vosk")
@@ -5539,7 +5548,7 @@ class SettingsDialog(Gtk.Dialog):
                                 # False return must not be read as success: it
                                 # means nothing was saved and the pickers still
                                 # show settings the engine never took.
-                                GLib.idle_add(self._resync_model_ui_from_config)
+                                GLib.idle_add(self._idle_resync_model_ui_from_config)
                                 GLib.idle_add(
                                     download_dialog.set_complete,
                                     False,
@@ -5555,7 +5564,7 @@ class SettingsDialog(Gtk.Dialog):
                         # The settings were never saved, so the previously working
                         # model is still the configured one; put the pickers back on
                         # it so the UI matches the config and a retry is possible.
-                        GLib.idle_add(self._resync_model_ui_from_config)
+                        GLib.idle_add(self._idle_resync_model_ui_from_config)
                         if "cancelled" in error_msg.lower():
                             GLib.idle_add(
                                 download_dialog.set_complete,
@@ -5582,18 +5591,43 @@ class SettingsDialog(Gtk.Dialog):
 
             logger.info(f"Auto-applying settings: {settings}")
 
-            was_running = self.speech_engine.state != RecognitionState.IDLE
-            if was_running:
-                self.speech_engine.stop_recognition()
+            def apply_already_downloaded() -> None:
+                try:
+                    self._apply_settings_internal(settings, raise_errors=True)
+                    logger.info("Settings auto-applied successfully")
+                except Exception as e:
+                    logger.error(f"Failed to auto-apply settings: {e}")
+                    GLib.idle_add(self._idle_resync_model_ui_from_config)
+                finally:
+                    GLib.idle_add(self._finish_auto_apply)
 
-            self.speech_engine.reconfigure(**settings)
-            self._save_selected_settings(settings)
-            logger.info("Settings auto-applied successfully")
+            threading.Thread(target=apply_already_downloaded, daemon=True).start()
+            worker_holds_guard = True
+            return
         except Exception as e:
             logger.error(f"Failed to auto-apply settings: {e}")
             self._resync_model_ui_from_config()
         finally:
-            self._applying_settings = False
+            if not worker_holds_guard:
+                self._applying_settings = False
+
+    def _finish_auto_apply(self) -> bool:
+        """Release the apply-guard after an already-downloaded worker finishes.
+
+        Always resync while the dialog is alive: handlers early-return during
+        apply, so selected settings can still match the saved config even when
+        a combo (whisper.cpp size) has already moved.
+        """
+        self._applying_settings = False
+        if self._dialog_is_alive():
+            self._resync_model_ui_from_config()
+        return False
+
+    def _idle_resync_model_ui_from_config(self) -> bool:
+        """Main-loop resync from a worker thread; no-op if the dialog is gone."""
+        if self._dialog_is_alive():
+            self._resync_model_ui_from_config()
+        return False
 
     def _resync_model_ui_from_config(self):
         """Put the pickers back on the settings that are actually saved.
@@ -5604,9 +5638,8 @@ class SettingsDialog(Gtk.Dialog):
         signal.
         """
         try:
-            saved_engine = (
-                self.config_manager.get_settings().get("speech_recognition", {}).get("engine")
-            )
+            sr_config = self.config_manager.get_settings().get("speech_recognition", {})
+            saved_engine = sr_config.get("engine")
             if saved_engine:
                 display = _engine_display_name(saved_engine)
                 if self.engine_combo.get_active_text() != display:
@@ -5620,6 +5653,9 @@ class SettingsDialog(Gtk.Dialog):
                     finally:
                         self._applying_settings = was_applying
             self._populate_model_options()
+            saved_language = sr_config.get("language")
+            if saved_language:
+                self._sync_language_options_for_selected_model(saved_language)
             self._update_model_info()
         except Exception as e:  # pragma: no cover - UI resync must never mask the original error
             logger.debug(f"Could not resync model pickers: {e}")
@@ -5732,6 +5768,13 @@ class SettingsDialog(Gtk.Dialog):
         """Handle click on the test button."""
         if self._test_active:
             logger.warning("Test already in progress.")
+            return
+
+        if self._applying_settings:
+            # The live engine may still be mid-reconfigure even when the UI
+            # already matches the saved config. Do not apply or start a test.
+            self.test_output_revealer.set_reveal_child(True)
+            self.test_buffer.set_text("Settings are still applying. Try Test again in a moment.")
             return
 
         current_config = self.config_manager.get_settings().get("speech_recognition", {})
@@ -5893,8 +5936,12 @@ For now, the engine has been reverted to VOSK."""
         self._populate_model_options()
         self._update_engine_specific_ui()
 
-    def apply_settings(self):
+    def apply_settings(self) -> bool:
         """Apply the selected settings."""
+        if self._applying_settings:
+            logger.warning("Ignoring apply_settings(); another apply is already in progress")
+            return False
+
         settings = self.get_selected_settings()
         logger.info(f"Applying settings: {settings}")
 
@@ -5918,7 +5965,7 @@ For now, the engine has been reverted to VOSK."""
                 # Same guard as in _auto_apply_settings: one download at a time.
                 self._show_download_busy_dialog()
                 self._resync_model_ui_from_config()
-                return
+                return False
             download_dialog = ModelDownloadDialog(
                 self,
                 model_name,
@@ -5946,7 +5993,7 @@ For now, the engine has been reverted to VOSK."""
                         if applied:
                             GLib.idle_add(download_dialog.set_complete, True, "")
                         else:
-                            GLib.idle_add(self._resync_model_ui_from_config)
+                            GLib.idle_add(self._idle_resync_model_ui_from_config)
                             GLib.idle_add(
                                 download_dialog.set_complete,
                                 False,
@@ -5961,7 +6008,7 @@ For now, the engine has been reverted to VOSK."""
                     error_msg = str(e)
                     # Nothing was saved, so the config still names the previous
                     # engine and model; put the pickers back on them.
-                    GLib.idle_add(self._resync_model_ui_from_config)
+                    GLib.idle_add(self._idle_resync_model_ui_from_config)
                     if "cancelled" in error_msg.lower():
                         GLib.idle_add(download_dialog.set_complete, False, "Download cancelled")
                     elif engine == "whisper" and "no module named" in error_msg.lower():
