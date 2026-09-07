@@ -77,6 +77,11 @@ DEFAULT_CONFIG = {
         # the variant is then derived from the selected language, because a bare size
         # name ("medium") is indistinguishable from the multilingual variant id.
         "whisper_cpp_model_variant": "",
+        # The second language offered once "I also dictate in other languages" is
+        # on. Empty means the main language is pinned on its own (#779).
+        "simple_second_language": "",
+        # Whether the Advanced island under the simple questions is left open.
+        "show_advanced": False,
         "parakeet_model_size": "v3-european",  # Parakeet TDT 0.6B v3 (25 European languages)
         "vad_sensitivity": 3,  # Voice Activity Detection sensitivity (1-5)
         "silence_timeout": 2.0,  # Seconds of silence before stopping

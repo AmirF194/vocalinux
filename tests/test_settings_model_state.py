@@ -61,6 +61,9 @@ def _dialog_stub() -> Mock:
     dialog._test_active = False
     dialog._populating_models = False
     dialog._processing_language_change = False
+    # A Mock attribute is truthy, which would make _auto_apply_settings think
+    # simple mode is mid-way through steering the controls (#779).
+    dialog._simple_driving = False
     dialog.language = "en-us"
     dialog._last_non_parakeet_language = None
     dialog._engine_for_language_memory = None
