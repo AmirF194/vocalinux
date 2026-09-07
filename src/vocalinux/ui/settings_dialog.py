@@ -58,6 +58,7 @@ from ..utils.whisper_model_info import (  # noqa: E402
 from ..utils.whispercpp_model_info import MODEL_SIZES as WHISPERCPP_MODEL_SIZES
 from ..utils.whispercpp_model_info import (
     WHISPERCPP_MODEL_INFO,
+    default_variant_for_size,
 )
 from ..utils.whispercpp_model_info import delete_model as delete_whispercpp_model
 from ..utils.whispercpp_model_info import (
@@ -80,6 +81,7 @@ from .config_manager import (  # noqa: E402
     DEFAULT_SOUND_EFFECT_TONE,
     PASTE_SHORTCUTS,
     SOUND_EFFECT_TONES,
+    resolve_whispercpp_variant,
 )
 from .keyboard_backends import (  # noqa: E402
     DEFAULT_SHORTCUT,
@@ -259,19 +261,7 @@ def _recommended_whispercpp_variant_for_language(
 
 def _default_whispercpp_variant_for_size(model_size: str, language_id: str) -> Optional[str]:
     """Return the default specialization for a user-selected size and language."""
-    variants = get_whispercpp_model_variants(model_size)
-    if not variants:
-        return None
-
-    english_variant = f"{model_size}.en"
-    if _language_is_english(language_id) and english_variant in variants:
-        return english_variant
-
-    standard_variant = "large" if model_size == "large" else model_size
-    if standard_variant in variants:
-        return standard_variant
-
-    return variants[0]
+    return default_variant_for_size(model_size, _language_is_english(language_id))
 
 
 def _is_language_paired_standard_variant(model_name: str) -> bool:
@@ -4874,12 +4864,29 @@ class SettingsDialog(Gtk.Dialog):
             self._populating_models = False
             self._refresh_unused_downloads()
 
+    def _resolve_saved_whispercpp_variant(self, saved_model_for_engine: str) -> str:
+        """Resolve which variant the saved configuration actually asks for.
+
+        ``whisper_cpp_model_size`` holds the id that loads the model, but for every
+        size below "large" the multilingual variant id *is* the bare size name, so
+        a stored "medium" cannot say whether the user chose the multilingual variant
+        or never chose anything. The explicit pin written by Settings answers that.
+        Without a pin the variant follows the selected language, which is what makes
+        picking English actually select an English-only model.
+
+        A leftover plain ``{size}.en`` English-only id is not treated as a permanent
+        specialization: it is re-derived from the language currently in the combo.
+        """
+        pinned = self.config_manager.get_model_variant_for_engine("whisper_cpp")
+        language_id = self.language_combo.get_active_id() or self.language
+        return resolve_whispercpp_variant(saved_model_for_engine, pinned, language_id)
+
     def _populate_whispercpp_model_options(self, saved_model_for_engine: str):
         """Populate whisper.cpp size and specialization selectors."""
         recommended_model, _ = self._get_recommended_whispercpp_model_for_language()
         recommended_size = get_whispercpp_model_size(recommended_model)
 
-        saved_model = saved_model_for_engine.lower()
+        saved_model = self._resolve_saved_whispercpp_variant(saved_model_for_engine)
         if saved_model not in WHISPERCPP_MODEL_INFO:
             saved_model = (
                 recommended_model if recommended_model in WHISPERCPP_MODEL_INFO else "tiny"
@@ -5637,7 +5644,7 @@ class SettingsDialog(Gtk.Dialog):
         except Exception as e:  # pragma: no cover - a resync must never mask the real error
             logger.debug(f"Could not check the engine picker against the config: {e}")
 
-    def _save_selected_settings(self, settings: dict):
+    def _save_selected_settings(self, settings: dict[str, Any]) -> None:
         """Persist selected settings to their appropriate config sections."""
         sr_settings = {k: v for k, v in settings.items() if not k.startswith("whispercpp_")}
         advanced_settings = {k: v for k, v in settings.items() if k.startswith("whispercpp_")}
@@ -5647,15 +5654,34 @@ class SettingsDialog(Gtk.Dialog):
             self.config_manager.set("advanced", key, value)
         self.config_manager.save_settings()
 
-    def get_selected_settings(self) -> dict:
+    def get_selected_settings(self) -> dict[str, Any]:
         """Return the currently selected settings from the UI."""
         engine_text = self.engine_combo.get_active_text()
         model_id = self.model_combo.get_active_id()
         language_id = self.language_combo.get_active_id()
 
         engine = _engine_from_display(engine_text) if engine_text else "vosk"
+        model_variant = ""
         if engine == "whisper_cpp":
-            model_size = self._get_selected_whispercpp_model()
+            selected = self._get_selected_whispercpp_model()
+            size = get_whispercpp_model_size(selected)
+            derived = self._get_default_whispercpp_variant_for_size(size)
+            # Full id for reconfigure/download. Pin deliberate specializations
+            # (including multilingual while English). A language-derived default
+            # stays unpinned so a later language change can re-derive — except
+            # when an existing bare-size pin already matches the selection: that
+            # is a deliberate multilingual pin that became the new language's
+            # default, and must survive so returning to English still honours it.
+            model_size = selected
+            existing_pin = (
+                self.config_manager.get_model_variant_for_engine("whisper_cpp") or ""
+            ).lower()
+            if selected != derived:
+                model_variant = selected
+            elif existing_pin == selected and selected in WHISPERCPP_MODEL_SIZES:
+                model_variant = selected
+            else:
+                model_variant = ""
         else:
             model_size = model_id.lower() if model_id else "small"
         language = language_id if language_id else self._default_language_for_engine(engine)
@@ -5666,6 +5692,7 @@ class SettingsDialog(Gtk.Dialog):
         settings = {
             "engine": engine,
             "model_size": model_size,
+            "model_variant": model_variant,
             "language": language,
             "vad_sensitivity": vad,
             "silence_timeout": silence,

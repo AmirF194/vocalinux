@@ -12,6 +12,10 @@ import threading
 from typing import Any, Optional
 
 from ..utils.paths import config_dir
+from ..utils.vosk_model_info import SUPPORTED_LANGUAGES
+from ..utils.whispercpp_model_info import MODEL_SIZES as WHISPERCPP_MODEL_SIZES
+from ..utils.whispercpp_model_info import WHISPERCPP_MODEL_INFO, default_variant_for_size
+from ..utils.whispercpp_model_info import get_model_size as get_whispercpp_model_size
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +73,10 @@ DEFAULT_CONFIG = {
         "vosk_model_size": "small",  # Default model for VOSK engine
         "whisper_model_size": "tiny",  # Default model for Whisper engine
         "whisper_cpp_model_size": "tiny",  # Default model for whisper.cpp engine
+        # Variant the user picked explicitly in Settings. Empty means "not pinned":
+        # the variant is then derived from the selected language, because a bare size
+        # name ("medium") is indistinguishable from the multilingual variant id.
+        "whisper_cpp_model_variant": "",
         "vad_sensitivity": 3,  # Voice Activity Detection sensitivity (1-5)
         "silence_timeout": 2.0,  # Seconds of silence before stopping
         "stop_sound_guard_ms": 200,  # Small tail trim to avoid the stop sound without clipping speech
@@ -149,6 +157,38 @@ DEFAULT_CONFIG = {
         "last_notified_version": "",
     },
 }
+
+
+def resolve_whispercpp_variant(saved_model: str, pinned_variant: str, language_id: str) -> str:
+    """Resolve the loadable whisper.cpp id for a saved size, pin, and language.
+
+    A pin outranks everything. When unpinned, a plain ``{size}.en`` English-only
+    id is the language-derived default, not a legacy specialization, so a later
+    language change can re-derive. True legacy specializations (quantized, turbo,
+    versioned large, ``{size}.en-q*``) are still honoured.
+    """
+    pinned = pinned_variant.lower() if isinstance(pinned_variant, str) else ""
+    if pinned in WHISPERCPP_MODEL_INFO:
+        return pinned
+
+    saved = saved_model.lower() if isinstance(saved_model, str) else ""
+    size = saved if saved in WHISPERCPP_MODEL_SIZES else get_whispercpp_model_size(saved or "tiny")
+    if size not in WHISPERCPP_MODEL_SIZES:
+        size = get_whispercpp_model_size("tiny")
+
+    # Honour true leftover specializations, but not a plain English-only id.
+    if (
+        saved in WHISPERCPP_MODEL_INFO
+        and saved not in WHISPERCPP_MODEL_SIZES
+        and saved != f"{size}.en"
+    ):
+        return saved
+
+    language_is_english = SUPPORTED_LANGUAGES.get(language_id, {}).get("whisper") == "en"
+    derived = default_variant_for_size(size, language_is_english)
+    if derived in WHISPERCPP_MODEL_INFO:
+        return derived
+    return saved if saved in WHISPERCPP_MODEL_INFO else "tiny"
 
 
 class ConfigManager:
@@ -432,23 +472,33 @@ class ConfigManager:
         return self.config
 
     def get_model_size_for_engine(self, engine: str) -> str:
-        """Get the saved model size for a specific engine.
+        """Return the model id the engine should load for ``engine``.
 
-        Args:
-            engine: The engine name ("vosk", "whisper", or "whisper_cpp")
-
-        Returns:
-            The model size for the engine, or the default if not found
+        For whisper.cpp an unpinned size is resolved against the saved
+        language so a stored bare size still loads ``{size}.en`` under English,
+        and a leftover plain ``{size}.en`` can re-derive after a language change.
         """
         sr_config = self.config.get("speech_recognition", {})
 
         # Try engine-specific model size first
         engine_key = f"{engine.lower()}_model_size"
         if engine_key in sr_config:
-            return sr_config[engine_key]
+            saved = sr_config[engine_key]
+        else:
+            # Fall back to generic model_size for backward compatibility
+            saved = sr_config.get("model_size", "small" if engine == "vosk" else "tiny")
 
-        # Fall back to generic model_size for backward compatibility
-        return sr_config.get("model_size", "small" if engine == "vosk" else "tiny")
+        if engine.lower() != "whisper_cpp":
+            return saved
+
+        # Unpinned configs store the bare size; the engine still needs the
+        # language-derived loadable id (and leftover ``{size}.en`` must not
+        # block a later language change).
+        return resolve_whispercpp_variant(
+            saved,
+            self.get_model_variant_for_engine(engine),
+            sr_config.get("language", "auto"),
+        )
 
     def set_model_size_for_engine(self, engine: str, model_size: str):
         """Set the model size for a specific engine.
@@ -465,6 +515,24 @@ class ConfigManager:
         # Also update the generic model_size for backward compatibility
         self.config["speech_recognition"]["model_size"] = model_size
         logger.info(f"Set {engine} model size to: {model_size}")
+
+    def get_model_variant_for_engine(self, engine: str) -> str:
+        """Return the variant the user pinned for an engine, or "" when unpinned.
+
+        Only whisper.cpp has variants. A pinned value means the user chose that
+        specialization in Settings; an empty value means the variant should be
+        derived from the selected language.
+        """
+        sr_config = self.config.get("speech_recognition", {})
+        return sr_config.get(f"{engine.lower()}_model_variant", "") or ""
+
+    def set_model_variant_for_engine(self, engine: str, model_variant: str) -> None:
+        """Pin the variant the user chose for an engine ("" clears the pin)."""
+        if "speech_recognition" not in self.config:
+            self.config["speech_recognition"] = {}
+
+        self.config["speech_recognition"][f"{engine.lower()}_model_variant"] = model_variant
+        logger.info(f"Set {engine} model variant to: {model_variant!r}")
 
     def is_voice_commands_enabled(self) -> bool:
         """Check if voice commands should be enabled.
@@ -484,7 +552,7 @@ class ConfigManager:
 
         return enabled
 
-    def update_speech_recognition_settings(self, settings: dict[str, Any]):
+    def update_speech_recognition_settings(self, settings: dict[str, Any]) -> None:
         """Update multiple speech recognition settings at once."""
         if "speech_recognition" not in self.config:
             self.config["speech_recognition"] = {}
@@ -493,10 +561,25 @@ class ConfigManager:
         if "engine" in settings and "model_size" in settings:
             engine = settings["engine"]
             model_size = settings["model_size"]
+            # Unpinned whisper.cpp: persist the bare size so a later language
+            # change can re-derive. Callers still pass the full loadable id as
+            # settings["model_size"] for reconfigure/download.
+            if engine == "whisper_cpp" and not settings.get("model_variant"):
+                model_size = get_whispercpp_model_size(model_size)
             self.set_model_size_for_engine(engine, model_size)
 
-        # Update all other keys present in the provided settings dict
+        # Empty means unpinned (derive from language). A non-empty value is a
+        # deliberate specialization, including multilingual while English.
+        if "engine" in settings and "model_variant" in settings:
+            self.set_model_variant_for_engine(settings["engine"], settings["model_variant"])
+
+        # Update remaining keys. model_size / model_variant were already applied
+        # through the engine-specific setters above (including bare-size persistence
+        # for an unpinned whisper.cpp selection); writing them again would put the
+        # full derived id back into the generic model_size key.
         for key, value in settings.items():
+            if key in ("model_size", "model_variant"):
+                continue
             self.config["speech_recognition"][key] = value
         logger.info(f"Updated speech recognition settings: {settings}")
 
