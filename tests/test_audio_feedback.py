@@ -4,7 +4,10 @@ Tests for the audio feedback functionality.
 
 import os
 import sys
+import tempfile
 import unittest
+import wave
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -12,20 +15,77 @@ import pytest
 # We need to use absolute paths for patching in module scope
 AUDIO_FEEDBACK_MODULE = "vocalinux.ui.audio_feedback"
 
+# Pytest collects files in command-line order, so this module may import after
+# tests that replace tempfile/wave in sys.modules with MagicMock. Rebind to
+# the real stdlib modules for WAV fixtures. Leave real tempfile in sys.modules
+# so a later `from tempfile import TemporaryDirectory` is not a MagicMock.
+# Do not pop tempfile in the per-test fixture below.
+if getattr(tempfile, "__name__", None) != "tempfile":
+    sys.modules.pop("tempfile", None)
+    import tempfile
+if getattr(wave, "__name__", None) != "wave":
+    sys.modules.pop("wave", None)
+    import wave
+
 
 @pytest.fixture(autouse=True)
 def reset_audio_module():
     """Reset the audio_feedback module before each test to allow proper testing."""
+    # Sibling tests replace sys.modules["wave"] with a MagicMock. Pin the real
+    # module this file imported so a reimported audio_feedback gets wave.open.
+    previous_wave = sys.modules.get("wave")
+    sys.modules["wave"] = wave
+
     # Remove the mock that conftest installs
     if AUDIO_FEEDBACK_MODULE in sys.modules:
         del sys.modules[AUDIO_FEEDBACK_MODULE]
 
-    yield
+    try:
+        yield
+    finally:
+        if previous_wave is None:
+            sys.modules.pop("wave", None)
+        else:
+            sys.modules["wave"] = previous_wave
 
-    # Restore the mock after test for other tests that need it
-    from conftest import mock_audio_feedback
+        # Restore the mock after test for other tests that need it
+        from conftest import mock_audio_feedback
 
-    sys.modules[AUDIO_FEEDBACK_MODULE] = mock_audio_feedback
+        sys.modules[AUDIO_FEEDBACK_MODULE] = mock_audio_feedback
+
+
+def _write_test_wav(
+    path: str,
+    *,
+    nframes: int = 80,
+    framerate: int = 8000,
+    nchannels: int = 1,
+    sampwidth: int = 2,
+    payload: bytes | None = None,
+) -> str:
+    """Write a tiny PCM WAV fixture and return ``path``."""
+    if payload is None:
+        payload = b"\x01\x00" * (nframes * nchannels)
+    with wave.open(path, "wb") as wav_file:
+        wav_file.setnchannels(nchannels)
+        wav_file.setsampwidth(sampwidth)
+        wav_file.setframerate(framerate)
+        wav_file.writeframes(payload)
+    return path
+
+
+def _popen_argv(mock_popen: Any) -> list[str]:
+    args, _kwargs = mock_popen.call_args
+    return list(args[0])
+
+
+def _assert_played_wav(argv: list[str], player: str, extra_flags: tuple[str, ...] = ()) -> str:
+    """Assert player argv shape and return the wav path that was played."""
+    assert argv[0] == player
+    assert argv[1 : 1 + len(extra_flags)] == list(extra_flags)
+    played = argv[-1]
+    assert str(played).endswith(".wav")
+    return played
 
 
 class TestAudioFeedback(unittest.TestCase):
@@ -190,95 +250,84 @@ class TestAudioFeedback(unittest.TestCase):
         # Import the module first
         import vocalinux.ui.audio_feedback as audio_feedback
 
-        with (
-            patch.object(audio_feedback.os.path, "exists", return_value=True),
-            patch.object(
-                audio_feedback,
-                "_get_audio_player",
-                return_value=("paplay", ["wav"]),
-            ),
-            patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
-        ):
-            # Call the function
-            result = audio_feedback._play_sound_file("test.wav")
+        with tempfile.TemporaryDirectory() as tmp:
+            cue = _write_test_wav(os.path.join(tmp, "cue.wav"))
+            with (
+                patch.object(
+                    audio_feedback,
+                    "_get_audio_player",
+                    return_value=("paplay", ["wav"]),
+                ),
+                patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
+            ):
+                result = audio_feedback._play_sound_file(cue)
 
-            # Verify the function returned True and called Popen correctly
             self.assertTrue(result)
             mock_popen.assert_called_once()
-            args, kwargs = mock_popen.call_args
-            self.assertEqual(args[0][0], "paplay")
-            self.assertEqual(args[0][1], "test.wav")
+            played = _assert_played_wav(_popen_argv(mock_popen), "paplay")
+            self.assertTrue(os.path.isfile(played), played)
 
     def test_play_sound_file_aplay(self):
         """Test playing sound with aplay."""
         # Import the module first
         import vocalinux.ui.audio_feedback as audio_feedback
 
-        with (
-            patch.object(audio_feedback.os.path, "exists", return_value=True),
-            patch.object(
-                audio_feedback,
-                "_get_audio_player",
-                return_value=("aplay", ["wav"]),
-            ),
-            patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
-        ):
-            # Call the function
-            result = audio_feedback._play_sound_file("test.wav")
+        with tempfile.TemporaryDirectory() as tmp:
+            cue = _write_test_wav(os.path.join(tmp, "cue.wav"))
+            with (
+                patch.object(
+                    audio_feedback,
+                    "_get_audio_player",
+                    return_value=("aplay", ["wav"]),
+                ),
+                patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
+            ):
+                result = audio_feedback._play_sound_file(cue)
 
-            # Verify the function returned True and called Popen correctly
             self.assertTrue(result)
             mock_popen.assert_called_once()
-            args, kwargs = mock_popen.call_args
-            self.assertEqual(args[0][0], "aplay")
-            self.assertEqual(args[0][1], "-q")
-            self.assertEqual(args[0][2], "test.wav")
+            played = _assert_played_wav(_popen_argv(mock_popen), "aplay", ("-q",))
+            self.assertTrue(os.path.isfile(played), played)
 
     def test_play_sound_file_mplayer(self):
         """Test playing sound with mplayer."""
         # Import the module first
         import vocalinux.ui.audio_feedback as audio_feedback
 
-        with (
-            patch.object(audio_feedback.os.path, "exists", return_value=True),
-            patch.object(
-                audio_feedback,
-                "_get_audio_player",
-                return_value=("mplayer", ["wav"]),
-            ),
-            patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
-        ):
-            # Call the function
-            result = audio_feedback._play_sound_file("test.wav")
+        with tempfile.TemporaryDirectory() as tmp:
+            cue = _write_test_wav(os.path.join(tmp, "cue.wav"))
+            with (
+                patch.object(
+                    audio_feedback,
+                    "_get_audio_player",
+                    return_value=("mplayer", ["wav"]),
+                ),
+                patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
+            ):
+                result = audio_feedback._play_sound_file(cue)
 
-            # Verify the function returned True and called Popen correctly
             self.assertTrue(result)
             mock_popen.assert_called_once()
-            args, kwargs = mock_popen.call_args
-            self.assertEqual(args[0][0], "mplayer")
-            self.assertEqual(args[0][1], "-really-quiet")
-            self.assertEqual(args[0][2], "test.wav")
+            played = _assert_played_wav(_popen_argv(mock_popen), "mplayer", ("-really-quiet",))
+            self.assertTrue(os.path.isfile(played), played)
 
     def test_play_sound_file_play(self):
         """Test playing sound with play (SoX)."""
         # Import the module first
         import vocalinux.ui.audio_feedback as audio_feedback
 
-        with (
-            patch.object(audio_feedback.os.path, "exists", return_value=True),
-            patch.object(audio_feedback, "_get_audio_player", return_value=("play", ["wav"])),
-            patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
-        ):
-            # Call the function
-            result = audio_feedback._play_sound_file("test.wav")
+        with tempfile.TemporaryDirectory() as tmp:
+            cue = _write_test_wav(os.path.join(tmp, "cue.wav"))
+            with (
+                patch.object(audio_feedback, "_get_audio_player", return_value=("play", ["wav"])),
+                patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
+            ):
+                result = audio_feedback._play_sound_file(cue)
 
-            # Verify the function returned True and called Popen correctly
             self.assertTrue(result)
             mock_popen.assert_called_once()
-            args, kwargs = mock_popen.call_args
-            self.assertEqual(args[0][0], "play")
-            self.assertEqual(args[0][1], "-q")
-            self.assertEqual(args[0][2], "test.wav")
+            played = _assert_played_wav(_popen_argv(mock_popen), "play", ("-q",))
+            self.assertTrue(os.path.isfile(played), played)
 
     def test_play_sound_file_exception(self):
         """Test handling exception when playing sound."""
@@ -303,6 +352,124 @@ class TestAudioFeedback(unittest.TestCase):
 
             # Verify the function returned False
             self.assertFalse(result)
+
+    def test_play_sound_file_prepends_silent_preroll(self):
+        """Real players play a WAV with leading silence of the preroll duration."""
+        import vocalinux.ui.audio_feedback as audio_feedback
+
+        framerate = 8000
+        nchannels = 1
+        sampwidth = 2
+        nframes = 80
+        payload = b"\x01\x00" * nframes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cue = _write_test_wav(
+                os.path.join(tmp, "cue.wav"),
+                nframes=nframes,
+                framerate=framerate,
+                nchannels=nchannels,
+                sampwidth=sampwidth,
+                payload=payload,
+            )
+            with (
+                patch.object(
+                    audio_feedback,
+                    "_get_audio_player",
+                    return_value=("paplay", ["wav"]),
+                ),
+                patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
+            ):
+                result = audio_feedback._play_sound_file(cue)
+
+            self.assertTrue(result)
+            mock_popen.assert_called_once()
+            played = _assert_played_wav(_popen_argv(mock_popen), "paplay")
+            self.assertTrue(os.path.isfile(played), played)
+            self.assertNotEqual(os.path.realpath(played), os.path.realpath(cue))
+
+            with wave.open(cue, "rb") as src, wave.open(played, "rb") as dst:
+                self.assertEqual(dst.getnchannels(), nchannels)
+                self.assertEqual(dst.getsampwidth(), sampwidth)
+                self.assertEqual(dst.getframerate(), framerate)
+                src_frames = src.getnframes()
+                dst_frames = dst.getnframes()
+                dst_bytes = dst.readframes(dst_frames)
+
+            preroll_ms = audio_feedback._SINK_WAKE_PREROLL_MS
+            expected_silence = max(1, int(round(framerate * preroll_ms / 1000.0)))
+            self.assertEqual(dst_frames, src_frames + expected_silence)
+
+            frame_size = nchannels * sampwidth
+            silence = dst_bytes[: expected_silence * frame_size]
+            rest = dst_bytes[expected_silence * frame_size :]
+            self.assertEqual(silence, b"\x00" * len(silence))
+            self.assertEqual(rest, payload)
+
+    def test_preroll_cache_reuses_built_file(self):
+        """The same source path and mtime reuse the prerolled WAV."""
+        import vocalinux.ui.audio_feedback as audio_feedback
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cue = _write_test_wav(os.path.join(tmp, "cue.wav"))
+            with (
+                patch.object(
+                    audio_feedback,
+                    "_get_audio_player",
+                    return_value=("paplay", ["wav"]),
+                ),
+                patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
+            ):
+                self.assertTrue(audio_feedback._play_sound_file(cue))
+                self.assertTrue(audio_feedback._play_sound_file(cue))
+
+            self.assertEqual(mock_popen.call_count, 2)
+            first = _assert_played_wav(list(mock_popen.call_args_list[0].args[0]), "paplay")
+            second = _assert_played_wav(list(mock_popen.call_args_list[1].args[0]), "paplay")
+            self.assertEqual(first, second)
+
+    def test_preroll_build_failure_falls_back_to_original(self):
+        """A preroll build error plays the original cue instead of failing closed."""
+        import vocalinux.ui.audio_feedback as audio_feedback
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cue = _write_test_wav(os.path.join(tmp, "cue.wav"))
+            with (
+                patch.object(
+                    audio_feedback,
+                    "_get_audio_player",
+                    return_value=("paplay", ["wav"]),
+                ),
+                patch.object(audio_feedback.wave, "open", side_effect=wave.Error("boom")),
+                patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
+            ):
+                result = audio_feedback._play_sound_file(cue)
+
+            self.assertTrue(result)
+            played = _assert_played_wav(_popen_argv(mock_popen), "paplay")
+            self.assertEqual(os.path.realpath(played), os.path.realpath(cue))
+
+    def test_preroll_eoferror_falls_back_to_original(self):
+        """A truncated/corrupt WAV raising EOFError still plays the original cue."""
+        import vocalinux.ui.audio_feedback as audio_feedback
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cue = os.path.join(tmp, "cue.wav")
+            with open(cue, "wb") as handle:
+                handle.write(b"RIFF")
+            with (
+                patch.object(
+                    audio_feedback,
+                    "_get_audio_player",
+                    return_value=("paplay", ["wav"]),
+                ),
+                patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
+            ):
+                result = audio_feedback._play_sound_file(cue)
+
+            self.assertTrue(result)
+            played = _assert_played_wav(_popen_argv(mock_popen), "paplay")
+            self.assertEqual(os.path.realpath(played), os.path.realpath(cue))
 
     def test_play_start_sound(self):
         """Test playing start sound (default tone is voca)."""
@@ -347,24 +514,23 @@ class TestAudioFeedback(unittest.TestCase):
         # Import the module first
         import vocalinux.ui.audio_feedback as audio_feedback
 
-        with (
-            patch.object(audio_feedback.os.path, "exists", return_value=True),
-            patch.object(
-                audio_feedback,
-                "_get_audio_player",
-                return_value=("ci_test_player", ["wav"]),
-            ),
-            patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
-        ):
-            # Call the function
-            result = audio_feedback._play_sound_file("test.wav")
+        with tempfile.TemporaryDirectory() as tmp:
+            cue = _write_test_wav(os.path.join(tmp, "cue.wav"))
+            with (
+                patch.object(
+                    audio_feedback,
+                    "_get_audio_player",
+                    return_value=("ci_test_player", ["wav"]),
+                ),
+                patch.object(audio_feedback.subprocess, "Popen") as mock_popen,
+            ):
+                result = audio_feedback._play_sound_file(cue)
 
-            # Verify the function returned True and called Popen correctly
             self.assertTrue(result)
             mock_popen.assert_called_once()
-            args, kwargs = mock_popen.call_args
-            self.assertEqual(args[0][0], "ci_test_player")
-            self.assertEqual(args[0][1], "test.wav")
+            argv = _popen_argv(mock_popen)
+            self.assertEqual(argv[0], "ci_test_player")
+            self.assertEqual(argv[1], cue)
 
     def test_get_audio_player_github_actions_fallback(self):
         """Test ci_test_player assignment in GitHub Actions without audio player."""
