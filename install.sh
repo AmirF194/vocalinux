@@ -365,7 +365,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --interactive, -i  Force interactive mode (default)"
             echo "  --auto           Non-interactive automatic installation"
-            echo "  --engine=NAME    Speech engine: whisper_cpp (default), whisper, vosk, parakeet, remote_api"
+            echo "  --engine=NAME    Speech engine: whisper_cpp (default), whisper, vosk, parakeet, faster_whisper, remote_api"
             echo "  --dev            Install in development mode with all dev dependencies"
             echo "  --test           Run tests after installation"
             echo "  --venv-dir=PATH  Specify custom virtual environment directory"
@@ -381,6 +381,7 @@ while [[ $# -gt 0 ]]; do
             echo "  $0                           # Interactive mode (recommended)"
             echo "  $0 --auto                    # Auto-install with whisper.cpp"
             echo "  $0 --auto --engine=vosk      # Auto-install VOSK only"
+            echo "  $0 --auto --engine=faster_whisper  # Auto-install faster-whisper"
             echo "  $0 --dev --test              # Dev mode with tests"
             echo ""
             echo "During installation a full transcript is saved to"
@@ -1251,7 +1252,15 @@ EOF
     echo "  └─────────────────────────────────────────────────────────────┘"
     echo ""
     echo "  ┌───────────────────────────────────────────────────────────────┐"
-    echo "  │  4. REMOTE API (ADVANCED)                                     │"
+    echo "  │  4. FASTER-WHISPER                                          │"
+    echo "  │     • Optional CTranslate2 Whisper backend                     │"
+    echo "  │     • Fast on CPU with INT8 quantization                      │"
+    echo "  │     • Best performance on NVIDIA GPUs (CUDA)                │"
+    echo "  │     • Hugging Face models stay checksum-gated (not auto-dl)  │"
+    echo "  └───────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  ┌───────────────────────────────────────────────────────────────┐"
+    echo "  │  5. REMOTE API (ADVANCED)                                     │"
     echo "  │     • Offload processing to a GPU server on your network      │"
     echo "  │     • Ideal for laptops without GPU                           │"
     echo "  │     • Supports whisper.cpp server & OpenAI-compatible APIs    │"
@@ -1277,7 +1286,7 @@ EOF
     esac
     echo ""
 
-    read -p "Choose engine [1-4] (default: $DEFAULT_CHOICE): " ENGINE_CHOICE
+    read -p "Choose engine [1-5] (default: $DEFAULT_CHOICE): " ENGINE_CHOICE
     ENGINE_CHOICE=${ENGINE_CHOICE:-$DEFAULT_CHOICE}
 
     case "$ENGINE_CHOICE" in
@@ -1294,6 +1303,10 @@ EOF
             ENGINE_DISPLAY="VOSK (Lightweight)"
             ;;
         4)
+            SELECTED_ENGINE="faster_whisper"
+            ENGINE_DISPLAY="Faster-Whisper"
+            ;;
+        5)
             SELECTED_ENGINE="remote_api"
             ENGINE_DISPLAY="Remote API"
             ;;
@@ -1547,12 +1560,11 @@ fi
 
 # Set default engine for auto/non-interactive mode
 if [[ "$NON_INTERACTIVE" == "yes" ]] && [[ -z "$SELECTED_ENGINE" ]]; then
-    # Default to whisper.cpp for best performance
     SELECTED_ENGINE="whisper_cpp"
     print_info "Automatic mode: Installing with whisper.cpp (default engine)"
-    print_info "For other engines, use: --engine=whisper or --engine=vosk or --engine=remote_api"
-    echo ""
+    print_info "For other engines, use: --engine=whisper, --engine=vosk, --engine=parakeet, --engine=faster_whisper, or --engine=remote_api"
 fi
+
 
 # Function to check if a command exists
 command_exists() {
@@ -2914,6 +2926,7 @@ engine_import_module() {
         whisper) echo "whisper" ;;
         whisper_cpp) echo "pywhispercpp.model" ;;
         parakeet) echo "sherpa_onnx" ;;
+        faster_whisper) echo "faster_whisper" ;;
         *) echo "" ;;
     esac
 }
@@ -2924,6 +2937,7 @@ engine_pip_name() {
         whisper) echo "openai-whisper" ;;
         whisper_cpp) echo "pywhispercpp" ;;
         parakeet) echo "sherpa-onnx" ;;
+        faster_whisper) echo "faster-whisper" ;;
         *) echo "" ;;
     esac
 }
@@ -3609,6 +3623,35 @@ REMOTE_CONFIG
                     print_success "Remote API configured with server: $REMOTE_API_URL"
                 else
                     print_warning "No server URL configured. You can set it later in Settings."
+                fi
+                ;;
+
+            faster_whisper)
+                print_info "Installing Faster-Whisper engine..."
+                print_info "This engine uses CTranslate2 for fast CPU inference."
+
+                if pip_install_extras_skip_pygobject "$PIP_LOG_FILE" faster_whisper; then
+                    mkdir -p "$CONFIG_DIR"
+                    if [ ! -f "$CONFIG_DIR/config.json" ]; then
+                        cat > "$CONFIG_DIR/config.json" << 'FASTER_WHISPER_CONFIG'
+{
+    "shortcuts": {
+        "toggle_recognition": "right_alt+right_alt",
+        "mode": "push_to_talk"
+    }
+}
+FASTER_WHISPER_CONFIG
+                    fi
+                    set_configured_engine "$CONFIG_DIR/config.json" faster_whisper ||
+                        print_warning "Could not point $CONFIG_DIR/config.json at the faster_whisper engine."
+                else
+                    print_error "Failed to install the faster-whisper engine"
+                    print_error "Falling back to whisper.cpp (recommended engine)"
+                    install_cpu_pywhispercpp "$PIP_LOG_FILE" || {
+                        print_error "Failed to install whisper.cpp fallback"
+                        return 1
+                    }
+                    SELECTED_ENGINE="whisper_cpp"
                 fi
                 ;;
         esac
@@ -4573,6 +4616,20 @@ verify_installation() {
         fi
     fi
 
+    if [[ "$selected_engine" == "faster_whisper" ]]; then
+        if ! "$VENV_DIR/bin/python" -c "import faster_whisper" 2>/dev/null; then
+            print_error "faster-whisper package installed but cannot be imported at runtime."
+            print_error ""
+            print_error "Diagnostic steps:"
+            print_error "  1. Check pip installation: $VENV_DIR/bin/pip show faster-whisper"
+            print_error "  2. Re-run the installer with: --engine=faster_whisper"
+            print_error "  3. Or switch to whisper.cpp: --engine=whisper_cpp"
+            ISSUES=$((ISSUES + 1))
+        else
+            print_success "faster-whisper import verified successfully."
+        fi
+    fi
+
     # Return the number of issues found
     return $ISSUES
 }
@@ -4626,6 +4683,10 @@ EOF
         parakeet)
             ENGINE_DISPLAY_NAME="Parakeet"
             BACKEND_INFO="CPU"
+            ;;
+        faster_whisper)
+            ENGINE_DISPLAY_NAME="Faster-Whisper"
+            BACKEND_INFO="PyTorch/CTranslate2"
             ;;
         remote_api)
             ENGINE_DISPLAY_NAME="Remote API"
