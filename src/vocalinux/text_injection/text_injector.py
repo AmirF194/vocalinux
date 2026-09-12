@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from enum import Enum
-from typing import Optional  # noqa: F401
+from typing import Optional
 
 from ..utils.host_process import host_env
 from ..utils.paths import config_dir
@@ -747,7 +747,7 @@ class TextInjector:
                 self._ibus_init_failed = True
             logger.warning(f"IBus initialization failed: {e}, continuing with fallback")
 
-    def _get_clipboard_tools(self):
+    def _get_clipboard_tools(self) -> list:
         tools = []
         # Prefer wl-copy on Wayland (including Flatpak with --socket=wayland).
         host_is_wayland = (
@@ -764,6 +764,10 @@ class TextInjector:
         if not host_is_wayland and shutil.which("wl-copy"):
             tools.append("wl-copy")
         return tools
+
+    def _x11_clipboard_tools(self) -> list:
+        """xclip/xsel only: the X11 CLIPBOARD an xdotool paste actually reads."""
+        return [name for name in ("xclip", "xsel") if shutil.which(name)]
 
     def _run_clipboard_command(self, tool: str, text: str) -> bool:
         # NB: wl-copy/xclip/xsel fork a background process that keeps owning the
@@ -949,7 +953,7 @@ class TextInjector:
         logger.debug("No better tools available, continuing with xdotool fallback")
         return False
 
-    def _copy_to_clipboard(self, text: str) -> bool:
+    def _copy_to_clipboard(self, text: str, tools: Optional[list] = None) -> bool:
         """
         Copy text to clipboard.
 
@@ -959,13 +963,16 @@ class TextInjector:
 
         Args:
             text: The text to copy to clipboard
+            tools: Clipboard binaries to try. Defaults to ``_get_clipboard_tools``
+                (session clipboard). XWayland paste passes xclip/xsel so the
+                text lands on the X11 CLIPBOARD that xdotool Ctrl+V reads.
 
         Returns:
             True if clipboard copy was successful, False otherwise
         """
         logger.info("Copying text to clipboard")
 
-        for tool in self._get_clipboard_tools():
+        for tool in tools if tools is not None else self._get_clipboard_tools():
             if self._clipboard_tool_health.get(tool) is False:
                 continue
 
@@ -988,7 +995,7 @@ class TextInjector:
         )
         return False
 
-    def _clear_clipboard(self) -> bool:
+    def _clear_clipboard(self, tools: Optional[list] = None) -> bool:
         """
         Clear the clipboard using the first available tool.
 
@@ -997,9 +1004,14 @@ class TextInjector:
         - xsel:    ``--clear`` flag
         - xclip:   pipe empty input (creates an empty text offer)
 
+        Args:
+            tools: Clipboard binaries to try. Defaults to ``_get_clipboard_tools``.
+                Pass the same list the matching copy used (xclip/xsel for an
+                XWayland paste) so restore hits the same selection.
+
         Returns True if the clipboard was cleared successfully.
         """
-        for tool in self._get_clipboard_tools():
+        for tool in tools if tools is not None else self._get_clipboard_tools():
             if self._clipboard_tool_health.get(tool) is False:
                 continue
             try:
@@ -1212,21 +1224,29 @@ class TextInjector:
         """
         Inject text using xdotool for X11 environments.
 
+        On WAYLAND_XDOTOOL, try an X11 clipboard paste first. ``xdotool type``
+        follows the active layout and garbles non-Latin text (#657).
+
         Args:
             text: The text to inject
         """
-        # Create environment with explicit X11 settings for Wayland compatibility
         env = os.environ.copy()
 
         if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
-            # Force X11 backend for XWayland
             env["GDK_BACKEND"] = "x11"
             env["QT_QPA_PLATFORM"] = "xcb"
-            # Ensure DISPLAY is set correctly for XWayland
-            if "DISPLAY" not in env or not env["DISPLAY"]:
+            if not env.get("DISPLAY"):
                 env["DISPLAY"] = ":0"
-
+            # xclip reads process env, not the type-path subprocess env.
+            os.environ.setdefault("DISPLAY", env["DISPLAY"])
             logger.debug(f"Using XWayland with DISPLAY={env['DISPLAY']}")
+            self._wait_for_modifiers_released()
+            if self._inject_via_clipboard_paste(text, env=env):
+                return
+            logger.warning(
+                "Clipboard paste failed, falling back to xdotool type "
+                "(character-by-character; text may be scrambled on non-US layouts)"
+            )
 
             # Add a small delay to ensure text is injected properly
             time.sleep(0.3)  # Increased delay for better reliability
@@ -1360,7 +1380,11 @@ class TextInjector:
         Requests text MIME types so image/file data is not treated as text.
         Returns the text, "" if a tool reports a verifiably empty clipboard,
         or None if unreadable as text (non-text data, no tool, or error).
+
+        On WAYLAND_XDOTOOL this reads the X11 CLIPBOARD (xclip/xsel), matching
+        the selection the xdotool paste wrote. wl-paste is a different clipboard.
         """
+        prefer_x11 = self.environment == DesktopEnvironment.WAYLAND_XDOTOOL
         host_is_wayland = (
             self._session_environment == DesktopEnvironment.WAYLAND
             or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
@@ -1369,13 +1393,13 @@ class TextInjector:
 
         # Bare `xclip -o` / `wl-paste` can return raw image bytes with rc=0.
         candidates: list[list[str]] = []
-        if host_is_wayland and shutil.which("wl-paste"):
+        if not prefer_x11 and host_is_wayland and shutil.which("wl-paste"):
             candidates.append(["wl-paste", "--no-newline", "--type", "text"])
         if shutil.which("xclip"):
             candidates.append(["xclip", "-selection", "clipboard", "-o", "-t", "UTF8_STRING"])
         if shutil.which("xsel"):
             candidates.append(["xsel", "--clipboard", "--output"])
-        if not host_is_wayland and shutil.which("wl-paste"):
+        if not prefer_x11 and not host_is_wayland and shutil.which("wl-paste"):
             candidates.append(["wl-paste", "--no-newline", "--type", "text"])
 
         saw_empty = False
@@ -1437,7 +1461,7 @@ class TextInjector:
             logger.debug(f"Terminal paste detection failed: {exc}")
             return False
 
-    def _inject_via_clipboard_paste(self, text: str) -> bool:
+    def _inject_via_clipboard_paste(self, text: str, env: Optional[dict] = None) -> bool:
         """
         Inject text by copying to clipboard and simulating a paste chord.
 
@@ -1446,10 +1470,17 @@ class TextInjector:
         that chord instead. Workaround for ydotool's US-ASCII-only key events
         (see issue #362). The chord itself is sent with wtype keysyms when
         that tool is usable, otherwise with a layout-resolved ydotool keycode
-        for Latin 'v' (issue #787). Saves the previous clipboard and restores
-        it after a short delay. Overlapping pastes share one restore target
+        for Latin 'v' (issue #787). On WAYLAND_XDOTOOL the copy uses xclip/xsel
+        and the chord is xdotool's, because the focused XWayland window pastes
+        the X11 CLIPBOARD (#657). Saves the previous clipboard and restores it
+        after a short delay. Overlapping pastes share one restore target
         (pre-first-injection content) and a generation counter so stale restore
         threads exit.
+
+        Args:
+            text: The text to inject.
+            env: Subprocess environment for the paste chord. XWayland passes the
+                DISPLAY=:0 env the type path already builds.
 
         Returns:
             True if successful, False otherwise
@@ -1459,6 +1490,9 @@ class TextInjector:
             "(saving clipboard to restore after paste)"
         )
 
+        prefer_x11 = self.environment == DesktopEnvironment.WAYLAND_XDOTOOL
+        tools = self._x11_clipboard_tools() if prefer_x11 else None
+
         # Inherit a pending restore target so a second paste in the delay window
         # still restores the original clipboard, not intermediate dictated text.
         with self._state_lock:
@@ -1467,17 +1501,26 @@ class TextInjector:
             pending_target if pending_target is not None else self._read_clipboard()
         )
 
-        if not self._copy_to_clipboard(text):
+        if not self._copy_to_clipboard(text, tools=tools):
             logger.warning("Could not copy text to clipboard for paste injection")
             return False
 
-        # Clipboard is overwritten — cancel any in-flight restore and take ownership.
+        # Clipboard is overwritten — take ownership. Publish the original
+        # clipboard now (first writer wins) so an overlapping paste inherits
+        # it even if this paste later fails.
         with self._state_lock:
             self._clipboard_restore_generation += 1
             generation = self._clipboard_restore_generation
+            if (
+                previous_clipboard is not None
+                and not self._should_copy_to_clipboard()
+                and self._clipboard_restore_target is None
+            ):
+                self._clipboard_restore_target = previous_clipboard
 
-        # Simulate paste. Prefer wtype keysyms (layout-independent) when that
-        # tool is usable; otherwise ydotool. ydotool syntax differs by version:
+        # Simulate paste. XWayland uses xdotool against the X11 CLIPBOARD;
+        # native Wayland prefers wtype keysyms, then layout-resolved ydotool.
+        # ydotool syntax differs by version:
         # - 0.1.x (distro packages): named sequences, e.g. ctrl+v
         # - 1.x (Flatpak build): keycode:value (29=LEFTCTRL, 42=LEFTSHIFT,
         #   and the evdev code that produces Latin 'v' on the active layout —
@@ -1493,7 +1536,12 @@ class TextInjector:
                 paste_cmd,
             )
             subprocess.run(
-                paste_cmd, check=True, stderr=subprocess.PIPE, text=True, timeout=3, env=host_env()
+                paste_cmd,
+                check=True,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3,
+                env=host_env(env),
             )
             logger.info(f"Text injected via clipboard paste: '{text[:20]}...' ({len(text)} chars)")
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
@@ -1503,35 +1551,41 @@ class TextInjector:
             if paste_cmd:
                 self._ydotool_release_paste_keys(paste_cmd)
             with self._state_lock:
-                if generation == self._clipboard_restore_generation:
+                stale = generation != self._clipboard_restore_generation
+                if not stale:
                     self._clipboard_restore_target = None
-            if previous_clipboard is not None and not self._should_copy_to_clipboard():
+            if (
+                not stale
+                and previous_clipboard is not None
+                and not self._should_copy_to_clipboard()
+            ):
                 if previous_clipboard == "":
-                    self._clear_clipboard()
+                    self._clear_clipboard(tools=tools)
                 else:
-                    self._copy_to_clipboard(previous_clipboard)
+                    self._copy_to_clipboard(previous_clipboard, tools=tools)
             return False
 
         # Delayed restore so Ctrl+V can land first. Skip when the user wants
         # dictated text left on the clipboard (copy_to_clipboard setting).
         if previous_clipboard is not None and not self._should_copy_to_clipboard():
-            with self._state_lock:
-                self._clipboard_restore_target = previous_clipboard
 
             def _restore() -> None:
                 time.sleep(0.3)
                 with self._state_lock:
                     if generation != self._clipboard_restore_generation:
                         return
+                    target = self._clipboard_restore_target
                     self._clipboard_restore_target = None
+                if target is None:
+                    return
                 # User copied something else during the delay — leave it alone.
                 if self._read_clipboard() != text:
                     logger.debug("Clipboard changed during restore delay; skipping restore")
                     return
-                if previous_clipboard == "":
-                    success = self._clear_clipboard()
+                if target == "":
+                    success = self._clear_clipboard(tools=tools)
                 else:
-                    success = self._copy_to_clipboard(previous_clipboard)
+                    success = self._copy_to_clipboard(target, tools=tools)
                 if success:
                     logger.debug("Clipboard restored to previous content")
                 else:
@@ -1737,9 +1791,13 @@ class TextInjector:
     def _clipboard_paste_command(self, *, terminal: bool = False) -> list:
         """Return argv for the clipboard paste chord.
 
-        Prefers wtype keysyms when that tool is usable (layout-independent).
-        Otherwise uses ydotool with a layout-resolved keycode for 'v'.
+        On WAYLAND_XDOTOOL, xdotool against the X11 CLIPBOARD (what an XWayland
+        window pastes from). Otherwise prefers wtype keysyms, then ydotool
+        with a layout-resolved keycode for 'v'.
         """
+        if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+            chord = "ctrl+shift+v" if terminal else "ctrl+v"
+            return ["xdotool", "key", "--clearmodifiers", chord]
         if self._wtype_usable_for_paste():
             return self._wtype_paste_command(terminal=terminal)
         return self._ydotool_ctrl_v_command(terminal=terminal)
