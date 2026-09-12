@@ -25,6 +25,9 @@ def test_snapcraft_recipe_and_gui_assets() -> None:
     plugs = set((doc.get("apps") or {}).get("vocalinux", {}).get("plugs") or [])
     assert "raw-input" in plugs
     assert "audio-record" in plugs
+    assert "uinput" in plugs
+    stage = doc["parts"]["vocalinux"].get("stage-packages") or []
+    assert "ydotool" in stage
 
     assert DESKTOP_FILE.is_file()
     assert SNAP_PNG.is_file()
@@ -45,6 +48,23 @@ def test_snap_puts_gnome_platform_first_on_ld_library_path() -> None:
     assert isinstance(ld_path, str)
     assert ld_path.startswith("$SNAP/gnome-platform/usr/lib/$CRAFT_ARCH_TRIPLET:")
     assert ld_path.endswith(":$LD_LIBRARY_PATH")
+
+
+def test_snap_docs_warn_that_0162_has_no_uinput_plug() -> None:
+    """v0.16.2 edge has no uinput plug; the connect command must not stand alone."""
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    install = (REPO_ROOT / "docs" / "INSTALL.md").read_text(encoding="utf-8")
+    update = (REPO_ROOT / "docs" / "UPDATE.md").read_text(encoding="utf-8")
+    changelog = (REPO_ROOT / "web" / "src" / "app" / "changelog" / "page.tsx").read_text(
+        encoding="utf-8"
+    )
+    snapcraft = SNAPCRAFT_YAML.read_text(encoding="utf-8")
+    for text in (readme, install, update, changelog, snapcraft):
+        uinput_lines = "\n".join(line for line in text.splitlines() if "uinput" in line.lower())
+        lowered = uinput_lines.lower()
+        assert "uinput" in lowered
+        assert "plug" in lowered and "no" in lowered
+        assert "0.17" not in uinput_lines
 
 
 def test_snap_strips_pygobject_and_uses_gnome_gi() -> None:
